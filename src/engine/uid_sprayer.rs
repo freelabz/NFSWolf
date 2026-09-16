@@ -1,0 +1,179 @@
+//! UID brute-force module.
+//!
+//! Iterates over UID/GID ranges to discover which identities
+//! have access to specific files or directories.
+
+// Toolkit API  --  not all items are used in currently-implemented phases.
+use std::sync::Arc;
+use std::time::Duration;
+
+use nfs_v3::wire::ACCESS3args;
+use tracing::{debug, warn};
+
+use crate::proto::circuit::CircuitBreaker;
+use crate::proto::nfs3::types::FileHandle;
+use crate::proto::nfs3::{Nfs3Client, PooledNfs3 as _};
+use crate::util::stealth::StealthConfig;
+
+/// NFS ACCESS procedure bits (RFC 1813 S3.3.4)  --  re-exported from the
+/// canonical location in `proto::nfs3::types::access`.
+///
+/// Re-exported here so callers that work with `UidSprayer` don't need to
+/// import from the protocol layer directly.
+pub(crate) use crate::proto::nfs3::types::access as access_bits;
+
+/// Result of a UID spray attempt.
+#[derive(Debug, Clone)]
+pub(crate) struct SprayResult {
+    /// UID that was tested.
+    pub uid: u32,
+    /// GID that was tested.
+    pub gid: u32,
+    /// Raw ACCESS bits returned by the server (bitmask of access_bits::*).
+    /// Callers filter this to find the access types they care about.
+    pub access: u32,
+}
+
+/// Configuration for UID spraying.
+#[derive(Debug)]
+pub(crate) struct SprayConfig {
+    /// Inclusive UID range to iterate.
+    pub uid_range: std::ops::RangeInclusive<u32>,
+    /// Inclusive GID range to iterate, when sweeping the cross product.
+    pub gid_range: std::ops::RangeInclusive<u32>,
+    /// Try each UID with the matching GID instead of the full cross product.
+    ///
+    /// The Linux per-user-group convention makes this the useful default: uid
+    /// 1000 almost always has gid 1000, so pairing finds the same access in
+    /// `n` probes that the cross product needs `n * 65536` to find.
+    pub paired_gid: bool,
+    /// Auxiliary GIDs to permute per UID attempt (injected into AUTH_SYS).
+    pub auxiliary_gids: Vec<u32>,
+    /// Remote path string (informational, included in Debug output).
+    pub _target_path: String,
+    /// Reserved for future parallel spray support.
+    pub _concurrency: usize,
+    /// Which access bits to test for (bitmask). Default: ALL.
+    /// The server always returns the full bitmask, but this controls
+    /// which results are considered "hits" for filtering/reporting.
+    pub required_access: u32,
+    /// Per-credential delay between attempts in ms (independent of global jitter).
+    pub per_attempt_delay_ms: u64,
+}
+
+/// UID/GID spray engine  --  iterates credential space to find NFS access.
+///
+/// Implements F-1.1 (UID/GID Spoofing) from FINDINGS.md. Each attempt is a fresh
+/// AUTH_SYS credential with a new stamp (RFC 1057 S9.2) to avoid caching.
+/// Deadline for one ACCESS probe during a sweep.
+///
+/// Matches the pooled transport's own RPC timeout; the sweep bypasses that
+/// transport to keep one connection, so it carries the same discipline itself.
+const SPRAY_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(crate) struct UidSprayer {
+    nfs3: Nfs3Client,
+    circuit: Arc<CircuitBreaker>,
+    stealth: StealthConfig,
+}
+
+impl std::fmt::Debug for UidSprayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UidSprayer").finish_non_exhaustive()
+    }
+}
+
+impl UidSprayer {
+    /// Create a new sprayer backed by the given NFSv3 client.
+    #[must_use]
+    pub(crate) const fn new(nfs3: Nfs3Client, circuit: Arc<CircuitBreaker>, stealth: StealthConfig) -> Self {
+        Self { nfs3, circuit, stealth }
+    }
+
+    /// Run the spray against `fh` using the given config.
+    ///
+    /// Returns all (uid, gid) pairs where the server granted any of the
+    /// `required_access` bits. Permission denials are expected and NOT
+    /// surfaced as warnings -- they don't trip the circuit breaker.
+    ///
+    /// All ACCESS calls are sent over a single NFS TCP session by swapping
+    /// the AUTH_SYS credential per-call (RFC 1057 S9.2).  This avoids
+    /// creating one connection per (uid, gid) pair, which would exhaust the
+    /// privileged source-port range (300-1023) after a few hundred attempts.
+    pub(crate) async fn spray(&self, config: &SprayConfig, fh: &FileHandle) -> Vec<SprayResult> {
+        let mut results = Vec::new();
+        let nfs_fh = fh.to_nfs_fh3();
+        let args = ACCESS3args { object: nfs_fh, access: access_bits::ALL };
+
+        // Check out a single connection for the entire spray.  All credential
+        // changes are applied inline; no additional MOUNT calls are made.
+        let mut conn = match self.nfs3.transport().checkout().await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(err = %e, "spray: failed to check out connection");
+                return results;
+            },
+        };
+
+        'outer: for uid in config.uid_range.clone() {
+            let gids: Vec<u32> = if config.paired_gid { vec![uid] } else { config.gid_range.clone().collect() };
+            for gid in gids {
+                // Check circuit breaker before every attempt.
+                if let Err(e) = self.check_circuit() {
+                    warn!(?e, "circuit breaker open, stopping spray");
+                    break 'outer;
+                }
+
+                if config.per_attempt_delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(config.per_attempt_delay_ms)).await;
+                }
+                self.stealth.wait().await;
+
+                // The sweep deliberately holds one connection so it does not
+                // re-MOUNT per candidate, which means it sits outside
+                // PooledTransport and must apply its own deadline: a server
+                // that accepts the TCP connection and then stops answering
+                // would otherwise wedge the loop forever on a single await,
+                // holding the pool's admission permit with it.
+                let call = conn.call_as::<_, nfs_v3::wire::ACCESS3res>(crate::proto::auth::AuthSys::with_groups(uid, gid, &config.auxiliary_gids, "nfswolf").to_opaque_auth(crate::proto::auth::next_stamp()), nfs_v3::PROGRAM, nfs_v3::VERSION, nfs_v3::wire::NFS_PROGRAM::NFSPROC3_ACCESS as u32, &args);
+                let Ok(outcome) = tokio::time::timeout(SPRAY_RPC_TIMEOUT, call).await else {
+                    warn!(uid, gid, "spray: RPC timed out; abandoning the sweep");
+                    conn.poison();
+                    self.circuit.record_failure(self.nfs3.host());
+                    break;
+                };
+                match outcome {
+                    Ok(res) => match res {
+                        nfs_v3::wire::Nfs3Result::Ok(ok) => {
+                            let granted = ok.access;
+                            debug!(uid, gid, access = granted, "spray: access granted");
+                            if granted & config.required_access != 0 {
+                                results.push(SprayResult { uid, gid, access: granted });
+                            }
+                        },
+                        nfs_v3::wire::Nfs3Result::Err((stat, _)) => {
+                            debug!(uid, gid, ?stat, "spray: access denied");
+                        },
+                        _ => {},
+                    },
+                    Err(e) => {
+                        warn!(uid, gid, err = %e, "spray: RPC error");
+                        // Poison the connection so the pool discards it on return.
+                        conn.poison();
+                        break 'outer;
+                    },
+                }
+            }
+        }
+
+        // Release the single spray connection (and its pool-admission permit)
+        // before returning, rather than at end-of-scope.
+        drop(conn);
+        results
+    }
+
+    /// Check the circuit breaker using the real server address from the client.
+    fn check_circuit(&self) -> anyhow::Result<()> {
+        self.circuit.check_or_wait(self.nfs3.host())
+    }
+}

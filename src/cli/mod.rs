@@ -1,0 +1,335 @@
+//! CLI argument parsing and subcommand dispatch.
+
+pub(crate) mod analyze;
+pub(crate) mod brute_handle;
+pub(crate) mod convert;
+pub(crate) mod decode;
+pub(crate) mod escape;
+pub(crate) mod mount;
+pub(crate) mod probe;
+pub(crate) mod scan;
+pub(crate) mod shell;
+pub(crate) mod target;
+pub(crate) mod uid_spray;
+
+use clap::{Parser, Subcommand};
+
+// --- Help section headings ---------------------------------------------------
+//
+// Every `#[arg]` carries a `help_heading = H_xxx` so `--help` renders in fixed
+// sections (Target / Identity / Permissions / Network / Stealth / Output /
+// Behavior). Section ordering follows declaration order of unique heading
+// strings, so the constants are listed below in the order we want them to
+// appear in `--help`.
+
+/// Where the toolkit gets the root file handle from (positional target,
+/// `--export`, or `--handle`).
+pub(crate) const H_TARGET: &str = "Target / Source";
+
+/// AUTH_SYS credential fields (uid, gid, hostname, aux GIDs).
+pub(crate) const H_IDENTITY: &str = "Identity";
+
+/// Per-operation safety belts (currently just `--allow-write`; the auto-UID
+/// ladder, owner-bit elevation, suid/dev passthrough, and shared-mount
+/// visibility are always-on across `shell` and `mount`).
+pub(crate) const H_PERMISSIONS: &str = "Permissions";
+
+/// Network-level toggles: alternate ports, transport, proxy, timeout.
+pub(crate) const H_NETWORK: &str = "Network";
+
+/// Timing knobs that make traffic less recognisable.
+pub(crate) const H_STEALTH: &str = "Stealth";
+
+/// Reporting / verbosity / file-output flags.
+pub(crate) const H_OUTPUT: &str = "Output";
+
+/// Per-subcommand behavior switches (the long tail of `--check-*`,
+/// `--probe-*`, `--no-*`, etc.).
+pub(crate) const H_BEHAVIOR: &str = "Behavior";
+
+// -----------------------------------------------------------------------------
+
+/// NFS security scanner, analyzer and exploitation toolkit for authorized assessments.
+///
+/// Common workflows:
+///   nfswolf scan 192.168.1.0/24            # discover NFS servers
+///   nfswolf analyze 192.168.1.10           # full security audit
+///   nfswolf shell 192.168.1.10:/srv        # interactive exploration
+///   nfswolf escape 192.168.1.10:/srv       # subtree-check bypass -> root handle
+///   nfswolf shell 192.168.1.10 --handle HEX  # HEX = output from escape
+#[derive(Parser)]
+#[command(
+    name = "nfswolf",
+    version,
+    about,
+    long_about = None,
+    // Suppress clap's flat `{subcommands}` block; the categorised listing is
+    // rendered by `after_help` (COMMANDS_HELP) since clap can't group subcommands.
+    help_template = "{about-with-newline}\n{usage-heading} {usage}\n\n{options}\n{after-help}",
+    after_help = COMMANDS_HELP,
+)]
+pub(crate) struct Cli {
+    /// AUTH_SYS UID to present to the NFS server (spoofed  --  server trusts this)
+    #[arg(short = 'u', long, global = true, default_value = "1000", value_name = "UID", help_heading = H_IDENTITY)]
+    pub uid: u32,
+
+    /// AUTH_SYS GID to present to the NFS server
+    #[arg(short = 'g', long, global = true, default_value = "1000", value_name = "GID", help_heading = H_IDENTITY)]
+    pub gid: u32,
+
+    /// Client hostname injected into AUTH_SYS credentials (spoofed)
+    #[arg(long, global = true, default_value = "localhost", value_name = "NAME", help_heading = H_IDENTITY)]
+    pub hostname: String,
+
+    /// Auxiliary GIDs in AUTH_SYS (comma-separated, e.g. `--aux-gids 42,15`).
+    /// Capped at 16 per RFC 1057 S9.2. Useful for the shadow GID trick:
+    /// add 42 (Debian/Ubuntu shadow group) or 15 (SUSE shadow) to read
+    /// /etc/shadow without no_root_squash.
+    #[arg(long, global = true, value_delimiter = ',', value_name = "G1,G2,...", help_heading = H_IDENTITY)]
+    pub aux_gids: Vec<u32>,
+
+    /// Bind from a privileged source port (<1024). Required by servers with
+    /// the `secure` export option. Needs root or CAP_NET_BIND_SERVICE.
+    #[arg(long, global = true, help_heading = H_NETWORK)]
+    pub privileged_port: bool,
+
+    /// Route all connections through a SOCKS5 proxy
+    #[arg(long, global = true, value_name = "HOST:PORT", help_heading = H_NETWORK)]
+    pub proxy: Option<String>,
+
+    /// Connection timeout in milliseconds
+    #[arg(short = 't', long, global = true, default_value = "3000", value_name = "MS", help_heading = H_NETWORK)]
+    pub timeout: u64,
+
+    /// Override the NFS port (skip portmapper). Applies to every subcommand
+    /// that opens an NFS connection -- shell, mount, escape, brute-handle,
+    /// uid-spray.
+    #[arg(long, global = true, value_name = "PORT", help_heading = H_NETWORK)]
+    pub nfs_port: Option<u16>,
+
+    /// Override the mount-daemon port (skip portmapper). Applies to every
+    /// subcommand that calls MOUNT.
+    #[arg(long, global = true, value_name = "PORT", help_heading = H_NETWORK)]
+    pub mount_port: Option<u16>,
+
+    /// Override the portmapper/rpcbind port (default 111). Applies to scanner
+    /// service discovery and analyzer portmapper queries.
+    #[arg(long, global = true, value_name = "PORT", help_heading = H_NETWORK)]
+    pub rpc_port: Option<u16>,
+
+    /// Skip all portmapper/rpcbind probes (DUMP, GETPORT, port 111). Use when
+    /// portmapper is firewalled and NFS port is known.
+    #[arg(long, global = true, help_heading = H_BEHAVIOR)]
+    pub skip_rpc: bool,
+
+    /// Skip all MOUNT daemon queries (EXPORT, MNT, DUMP). NFSv4 pseudo-FS
+    /// discovery still runs.
+    #[arg(long, global = true, help_heading = H_BEHAVIOR)]
+    pub skip_mountd: bool,
+
+    /// Delay between RPC calls in milliseconds (stealth mode)
+    #[arg(long, global = true, default_value = "0", value_name = "MS", help_heading = H_STEALTH)]
+    pub delay: u64,
+
+    /// Random jitter added to each delay (0 = no jitter)
+    #[arg(long, global = true, default_value = "0", value_name = "MS", help_heading = H_STEALTH)]
+    pub jitter: u64,
+
+    /// Disable ANSI colour output (also set by NO_COLOR env var)
+    #[arg(long, global = true, help_heading = H_OUTPUT)]
+    pub no_color: bool,
+
+    /// Increase log verbosity (-v info, -vv debug, -vvv trace)
+    #[arg(short, long, global = true, action = clap::ArgAction::Count, help_heading = H_OUTPUT)]
+    pub verbose: u8,
+
+    /// Suppress status lines; only emit findings and errors
+    #[arg(short, long, global = true, help_heading = H_OUTPUT)]
+    pub quiet: bool,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum Command {
+    // --- Recon: discover, audit, and break out of exports ---
+    /// Discover NFS servers on a network
+    Scan(scan::ScanArgs),
+
+    /// Deep security audit of an NFS server
+    Analyze(analyze::AnalyzeArgs),
+
+    /// Escape an export to the filesystem root via subtree_check bypass
+    Escape(escape::EscapeArgs),
+
+    // --- Connect: interactive / filesystem access ---
+    /// Interactive NFS exploration shell
+    Shell(shell::ShellArgs),
+
+    /// FUSE-mount an NFS export with UID spoofing
+    #[cfg(feature = "fuse")]
+    Mount(mount::MountArgs),
+
+    // --- Advanced: last-resort handle / credential brute force ---
+    /// Brute-force NFS file handles using the STALE/BADHANDLE oracle
+    BruteHandle(brute_handle::BruteHandleArgs),
+
+    /// UID/GID spray (last-resort credential discovery)
+    UidSpray(uid_spray::UidSprayArgs),
+
+    // --- Utilities: reporting and shell integration ---
+    /// Convert an `analyze --json` dump into HTML/Markdown/CSV/TXT/console
+    Convert(convert::ConvertArgs),
+
+    /// Decode an NFS file handle and print every field
+    Decode(decode::DecodeArgs),
+
+    /// Generate shell completions
+    Completions(CompletionsArgs),
+}
+
+/// Categorised command listing shown in `--help` via `after_help`.
+///
+/// clap 4.x cannot group subcommands under headings the way it groups args
+/// (`help_heading` is args-only), so the help template suppresses the auto
+/// `{subcommands}` block and the grouped listing is rendered here instead. The
+/// `mount` line is gated on the `fuse` feature so the musl-static build (which
+/// drops FUSE) stays accurate.
+#[cfg(feature = "fuse")]
+const COMMANDS_HELP: &str = concat!(
+    "Commands:\n",
+    "  Recon:\n",
+    "    scan          Discover NFS servers on a network\n",
+    "    analyze       Deep security audit of an NFS server\n",
+    "    escape        Break out of an export to the filesystem root (subtree_check bypass)\n",
+    "  Connect:\n",
+    "    shell         Interactive NFS exploration shell\n",
+    "    mount         FUSE-mount an NFS export with UID spoofing\n",
+    "  Advanced:\n",
+    "    brute-handle  Brute-force file handles via the STALE/BADHANDLE oracle\n",
+    "    uid-spray     UID/GID spray (last-resort credential discovery)\n",
+    "  Utilities:\n",
+    "    convert       Render an `analyze --json` dump to HTML/MD/CSV/TXT/console\n",
+    "    decode        Decode an NFS file handle and print every field\n",
+    "    completions   Generate shell completions\n",
+    "\n",
+    "Run `nfswolf <COMMAND> --help` for per-command options.",
+);
+
+/// Same listing for the `--no-default-features` build, which omits `mount`.
+#[cfg(not(feature = "fuse"))]
+const COMMANDS_HELP: &str = concat!(
+    "Commands:\n",
+    "  Recon:\n",
+    "    scan          Discover NFS servers on a network\n",
+    "    analyze       Deep security audit of an NFS server\n",
+    "    escape        Break out of an export to the filesystem root (subtree_check bypass)\n",
+    "  Connect:\n",
+    "    shell         Interactive NFS exploration shell\n",
+    "  Advanced:\n",
+    "    brute-handle  Brute-force file handles via the STALE/BADHANDLE oracle\n",
+    "    uid-spray     UID/GID spray (last-resort credential discovery)\n",
+    "  Utilities:\n",
+    "    convert       Render an `analyze --json` dump to HTML/MD/CSV/TXT/console\n",
+    "    decode        Decode an NFS file handle and print every field\n",
+    "    completions   Generate shell completions\n",
+    "\n",
+    "Run `nfswolf <COMMAND> --help` for per-command options.",
+);
+
+#[derive(Parser)]
+pub(crate) struct CompletionsArgs {
+    /// Shell to generate completions for
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
+}
+
+/// Global options extracted from the top-level CLI for passing to subcommands.
+#[derive(Debug, Clone)]
+pub(crate) struct GlobalOpts {
+    /// Override UID for all NFS operations.
+    pub uid: u32,
+    /// Override GID for all NFS operations.
+    pub gid: u32,
+    /// Spoofed client hostname in AUTH_SYS credentials.
+    pub hostname: String,
+    /// Auxiliary GIDs added to AUTH_SYS credentials (capped at 16 per RFC 1057 S9.2).
+    pub aux_gids: Vec<u32>,
+    /// Whether to bind to a privileged port (<1024).
+    pub privileged_port: bool,
+    /// Optional SOCKS5 proxy address.
+    pub proxy: Option<String>,
+    /// Connection timeout in milliseconds.
+    pub timeout: u64,
+    /// Override NFS port (skip portmapper) when set.
+    pub nfs_port: Option<u16>,
+    /// Override mount-daemon port (skip portmapper) when set.
+    pub mount_port: Option<u16>,
+    /// Override portmapper/rpcbind port when set.
+    pub rpc_port: Option<u16>,
+    /// Skip all portmapper/rpcbind probes.
+    pub skip_rpc: bool,
+    /// Skip all MOUNT daemon queries.
+    pub skip_mountd: bool,
+    /// Delay between operations in milliseconds.
+    pub delay: u64,
+    /// Random jitter added to delay in milliseconds.
+    pub jitter: u64,
+    /// Disable colored output.
+    pub no_color: bool,
+    /// Verbose logging level (set by CLI, consumed by tracing subscriber init).
+    pub _verbose: u8,
+    /// Suppress non-essential output.
+    pub quiet: bool,
+}
+
+impl Cli {
+    /// Extract the global options into a standalone struct.
+    ///
+    /// Called in main() before matching on the subcommand so global
+    /// values survive the partial move of `cli.command`.
+    #[must_use]
+    pub(crate) fn global_opts(&self) -> GlobalOpts {
+        GlobalOpts {
+            uid: self.uid,
+            gid: self.gid,
+            hostname: self.hostname.clone(),
+            aux_gids: self.aux_gids.clone(),
+            privileged_port: self.privileged_port,
+            proxy: self.proxy.clone(),
+            timeout: self.timeout,
+            nfs_port: self.nfs_port,
+            mount_port: self.mount_port,
+            rpc_port: self.rpc_port,
+            skip_rpc: self.skip_rpc,
+            skip_mountd: self.skip_mountd,
+            delay: self.delay,
+            jitter: self.jitter,
+            no_color: self.no_color,
+            _verbose: self.verbose,
+            quiet: self.quiet,
+        }
+    }
+}
+
+pub(crate) fn completions(args: &CompletionsArgs) {
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    clap_complete::generate(args.shell, &mut cmd, "nfswolf", &mut std::io::stdout());
+}
+
+/// Print a `# rerun: ...` line to stderr after a successful subcommand.
+///
+/// The line echoes back the literal argv the user typed (minus the
+/// program name), which is the most useful thing to copy into shell
+/// history. Skipped when `--quiet` is set.
+pub(crate) fn emit_replay(globals: &GlobalOpts) {
+    if globals.quiet {
+        return;
+    }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.is_empty() {
+        return;
+    }
+    eprintln!("# rerun: nfswolf {}", argv.join(" "));
+}

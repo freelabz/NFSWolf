@@ -1,0 +1,228 @@
+//! Shared terminal output utilities for consistent formatting across all subcommands.
+//!
+//! All functions respect the global `no_color` flag.  Call `apply_no_color(true)`
+//! once at startup (in main.rs) when the flag is set; the `colored` crate then
+//! strips escape sequences from all subsequent `.red()`, `.bold()`, etc. calls.
+
+use std::time::{Duration, Instant};
+
+use colored::Colorize as _;
+use tabled::builder::Builder;
+use tabled::settings::{Alignment, Modify, Style, object::Columns};
+
+use crate::engine::analyzer::Severity;
+
+// --- color / no-color control ------------------------------------------------
+
+/// Disable ANSI colours globally when `no_color` is true.
+///
+/// Must be called before any output is produced.  Uses `colored`'s global
+/// override so that every `.red()` / `.bold()` call becomes a no-op.
+pub(crate) fn apply_no_color(no_color: bool) {
+    if no_color {
+        colored::control::set_override(false);
+    }
+}
+
+// --- status line helpers -----------------------------------------------------
+
+/// `[*] msg` in bold blue  --  informational progress line.
+pub(crate) fn status_info(msg: &str) -> String {
+    format!("{} {msg}", "[*]".bold().blue())
+}
+
+/// `[+] msg` in bold green  --  success / found.
+pub(crate) fn status_ok(msg: &str) -> String {
+    format!("{} {msg}", "[+]".bold().green())
+}
+
+/// `[!] msg` in bold yellow  --  advisory warning.
+pub(crate) fn status_warn(msg: &str) -> String {
+    format!("{} {msg}", "[!]".bold().yellow())
+}
+
+/// `[-] msg` in bold red  --  failure / not found.
+pub(crate) fn status_err(msg: &str) -> String {
+    format!("{} {msg}", "[-]".bold().red())
+}
+
+// --- section headers ---------------------------------------------------------
+
+/// Print a bold section header:  `---  TITLE  -------------------------------`
+pub(crate) fn section_header(title: &str) {
+    let line = format!("  {}  {}", title, "-".repeat(60usize.saturating_sub(title.len() + 4)));
+    println!("{}", line.bold().white());
+}
+
+/// Print a top-level banner for a host/operation.
+pub(crate) fn banner(title: &str) {
+    let width = title.len() + 4;
+    let bar = "=".repeat(width);
+    println!("{}", format!("+{bar}+").bold().white());
+    println!("{}", format!("|  {title}  |").bold().white());
+    println!("{}", format!("+{bar}+").bold().white());
+}
+
+// --- untrusted-string sanitization -------------------------------------------
+
+/// Strip terminal control characters from untrusted server-derived strings
+/// before printing them to the live console.
+///
+/// Evidence snippets, export paths, and allowed-client lists all originate from
+/// the untrusted NFS server (file content via `from_utf8_lossy`, MOUNT export
+/// list). ESC (0x1b) is valid UTF-8 and survives lossy decoding, so a malicious
+/// server could otherwise rewrite the operator's screen the instant `analyze`
+/// prints. Mirrors the report renderers' `sanitize_control`; C0/DEL/C1 -> '.'.
+#[must_use]
+pub(crate) fn sanitize_terminal(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '.' } else { c }).collect()
+}
+
+// --- file handle display -----------------------------------------------------
+
+/// Print a file handle (hex) on its own line, clearly labeled for copy-paste.
+///
+/// The hex is rendered in cyan so it stands out visually.  Prints to stdout.
+pub(crate) fn print_handle(label: &str, hex: &str) {
+    // The label can be a server-supplied export path (analyze's File Handles
+    // section), so neutralize terminal control bytes in it; the hex is safe.
+    println!("  {}: {}", sanitize_terminal(label).bold(), hex.cyan());
+}
+
+/// Print a "next steps" suggestion after an escape, pointing the operator
+/// at the two surfaces that consume a raw handle (`shell --handle` and
+/// `mount --handle`). Both honour `--allow-write` and the auto-UID ladder,
+/// so any read/write/walk/grep workflow works through them.
+pub(crate) fn print_handle_next_steps(hex: &str, host: &str) {
+    println!();
+    println!("  {} Copy the handle above and use it with:", "Next steps:".bold().yellow());
+    println!("    {} shell {} --handle {}", "nfswolf".dimmed(), host, hex.cyan());
+    println!("    {} mount {} /mnt/escaped --handle {}", "nfswolf".dimmed(), host, hex.cyan());
+}
+
+// --- timing ------------------------------------------------------------------
+
+/// Format an elapsed duration as `"1.23s"` or `"304ms"`.
+pub(crate) fn elapsed(start: Instant) -> String {
+    let d = start.elapsed();
+    if d < Duration::from_secs(1) { format!("{}ms", d.as_millis()) } else { format!("{:.2}s", d.as_secs_f64()) }
+}
+
+// --- severity badges ---------------------------------------------------------
+
+/// Return a padded, coloured severity label for terminal output.
+pub(crate) fn severity_badge(sev: Severity) -> String {
+    match sev {
+        Severity::Critical => "[CRITICAL]".red().bold().to_string(),
+        Severity::High => "[HIGH]    ".yellow().bold().to_string(),
+        Severity::Medium => "[MEDIUM]  ".cyan().to_string(),
+        Severity::Low => "[LOW]     ".white().to_string(),
+        Severity::Info => "[INFO]    ".dimmed().to_string(),
+    }
+}
+
+// --- export table -------------------------------------------------------------
+
+/// One row for the exports summary table.
+pub(crate) struct ExportRow {
+    pub path: String,
+    pub clients: String,
+    pub auth: String,
+    pub flags: String,
+    pub handle_hex: String,
+}
+
+/// Build and print an exports table using the rounded tabled style.
+pub(crate) fn print_export_table(rows: &[ExportRow]) {
+    if rows.is_empty() {
+        println!("  {}", "(no exports found)".dimmed());
+        return;
+    }
+    let mut builder = Builder::default();
+    builder.push_record(["Path", "Allowed clients", "Auth", "Flags", "Handle (partial)"]);
+    for r in rows {
+        // path and clients come from the untrusted server (MOUNT export list);
+        // neutralize terminal control bytes before display.
+        let path = sanitize_terminal(&r.path);
+        let clients_clean = sanitize_terminal(&r.clients);
+        let clients = if clients_clean == "*" || clients_clean.is_empty() { clients_clean.red().to_string() } else { clients_clean.normal().to_string() };
+        let flags = if r.flags.contains("WILDCARD") || r.flags.contains("NO_ROOT_SQUASH") {
+            r.flags.red().to_string()
+        } else if !r.flags.is_empty() {
+            r.flags.yellow().to_string()
+        } else {
+            r.flags.dimmed().to_string()
+        };
+        // Show only the first 16 hex chars of the handle to keep the table narrow.
+        let handle_short = if r.handle_hex.len() > 16 { format!("{}...", &r.handle_hex[..16]) } else { r.handle_hex.clone() };
+        builder.push_record([&path, &clients, &r.auth, &flags, &handle_short.dimmed().to_string()]);
+    }
+    let mut table = builder.build();
+    _ = table.with(Style::rounded());
+    _ = table.with(Modify::new(Columns::first()).with(Alignment::left()));
+    println!("{table}");
+}
+
+// --- findings list ------------------------------------------------------------
+
+/// Print a list of findings with severity badge, export tag, and evidence.
+pub(crate) fn print_findings(findings: &[crate::engine::analyzer::Finding]) {
+    if findings.is_empty() {
+        println!("  {}", status_ok("No findings  --  server appears well-configured"));
+        return;
+    }
+    for f in findings {
+        let badge = severity_badge(f.severity);
+        let export_tag = f.export.as_deref().map_or_else(String::new, |e| format!("  {}", sanitize_terminal(e).dimmed()));
+        println!("  {badge}{export_tag}  {}  {}", f.id.bold(), f.title);
+        if !f.evidence.is_empty() {
+            println!("    {}: {}", "Evidence".dimmed(), sanitize_terminal(&f.evidence));
+        }
+    }
+}
+
+/// Print a compact findings count summary line.
+pub(crate) fn print_findings_summary(findings: &[crate::engine::analyzer::Finding]) {
+    let critical = findings.iter().filter(|f| matches!(f.severity, Severity::Critical)).count();
+    let high = findings.iter().filter(|f| matches!(f.severity, Severity::High)).count();
+    let medium = findings.iter().filter(|f| matches!(f.severity, Severity::Medium)).count();
+    let low = findings.iter().filter(|f| matches!(f.severity, Severity::Low) | matches!(f.severity, Severity::Info)).count();
+
+    let mut parts = Vec::new();
+    if critical > 0 {
+        parts.push(format!("{critical} critical").red().bold().to_string());
+    }
+    if high > 0 {
+        parts.push(format!("{high} high").yellow().to_string());
+    }
+    if medium > 0 {
+        parts.push(format!("{medium} medium").cyan().to_string());
+    }
+    if low > 0 {
+        parts.push(format!("{low} low/info").dimmed().to_string());
+    }
+
+    if parts.is_empty() {
+        println!("  {} No findings", "[+]".bold().green());
+    } else {
+        println!("  Findings: {}", parts.join(", "));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_terminal_replaces_control_chars() {
+        assert_eq!(sanitize_terminal("\x1b[31mred\x1b[0m"), ".[31mred.[0m");
+        assert_eq!(sanitize_terminal("\x00\x01\x02"), "...");
+        assert_eq!(sanitize_terminal("a\nb\tc"), "a.b.c");
+    }
+
+    #[test]
+    fn sanitize_terminal_passes_normal_text() {
+        assert_eq!(sanitize_terminal("hello world"), "hello world");
+        assert_eq!(sanitize_terminal(""), "");
+    }
+}
